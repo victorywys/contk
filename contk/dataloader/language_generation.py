@@ -1,240 +1,86 @@
 """Dataloader for language generation"""
 from collections import Counter
 from itertools import chain
-import random
 
 import numpy as np
 
-from .dataloader import Dataloader
-from ..metric import MetricChain, PerlplexityMetric, BleuCorpusMetric, LanguageGenerationRecorder
+from .._utils.unordered_hash import UnorderedSha256
+from .dataloader import BasicLanguageGeneration
+from ..metric import MetricChain, PerlplexityMetric, LanguageGenerationRecorder, \
+	HashValueRecorder
 
-from .._utils import trim_before_target
+# pylint: disable=W0223
+class LanguageGeneration(BasicLanguageGeneration):
+	r"""Base class for language modelling datasets. This is an abstract class.
 
+	Arguments:{ARGUMENTS}
 
-class LanguageGeneration(Dataloader):
-	r"""Base class for language generation datasets. This is an abstract class.
-
-	Arguments:
-			ext_vocab (list): special tokens. default: `["<pad>", "<unk>", "<go>", "<eos>"]`
-			key_name (list): name of subsets of the data. default: `["train", "dev", "test"]`
-
-	Attributes:
-			ext_vocab (list): special tokens, be placed at beginning of `vocab_list`.
-					For example: `["<pad>", "<unk>", "<go>", "<eos>"]`
-			pad_id (int): token for padding, always equal to `0`
-			unk_id (int): token for unkown words, always equal to `1`
-			go_id (int): token at the beginning of sentences, always equal to `2`
-			eos_id (int): token at the end of sentences, always equal to `3`
-			key_name (list): name of subsets of the data. For example: `["train", "dev", "test"]`
-			vocab_list (list): vocabulary list of the datasets.
-			word2id (dict): a dict mapping tokens to index.
-					Maybe you want to use :meth:`sen_to_index` instead.
+	Attributes:{ATTRIBUTES}
 	"""
 
-	def __init__(self,
-				 ext_vocab=None,
-				 key_name=None,
-				 ):
-		super().__init__()
+	ARGUMENTS = BasicLanguageGeneration.ARGUMENTS
+	ATTRIBUTES = BasicLanguageGeneration.ATTRIBUTES
 
-		# initialize by default value. (can be overwritten by subclass)
-		self.ext_vocab = ext_vocab or ["<pad>", "<unk>", "<go>", "<eos>"]
-		self.pad_id = self.ext_vocab.index("<pad>")
-		self.unk_id = self.ext_vocab.index("<unk>")
-		self.go_id = self.ext_vocab.index("<go>")
-		self.eos_id = self.ext_vocab.index("<eos>")
-		self.key_name = key_name or ["train", "dev", "test"]
-
-		# initialize by subclass
-		self.vocab_list, self.data = self._load_data()
-		self.word2id = {w: i for i, w in enumerate(self.vocab_list)}
-
-		# postprocess initialization
-		self.index = {}
-		self.batch_id = {}
-		self.batch_size = {}
-		for key in self.key_name:
-			self.batch_id[key] = 0
-			self.batch_size[key] = None
-			self.index[key] = list(range(len(self.data[key])))
-
-	def _load_data(self):
-		r'''This function is called during the initialization.
-
-		Returns:
-				(tuple): tuple containing (refer to the following example):
-
-						vocab_list (list): vocabulary list of the datasets.
-						data (dict): a dict contains data.
-
-		Examples:
-		.. highlight:: python
-		.. code-block:: python
-				vocab_list = ["<pad>", "<unk>", "<go>", "<eos>", "how", \
-										  "are", "you", "hello", "i", "am", \
-										  "fine"]
-				data = {
-						"train": [
-								[2, 5, 6, 7, 3],  # first sentence: <go> how are you <eos>
-								[2, 9, 10, 11, 3], # second response: <go> i am fine <eos>
-						],
-						"dev": [...],   # similar to train
-						"test": [...],  # similar to train
-				}
-
-		Notes:
-				You can use ``ext_vocab``, ``key_name``, ``pad_id``, ``unk_id``, ``go_id``,
-				``eos_id``, but other attributes are not initialized.
-		'''
-		raise NotImplementedError(
-			"This function should be implemented by subclasses.")
-
-	@property
-	def vocab_size(self):
-		'''Equals to `len(self.vocab_list)`. Read only.
-		'''
-		return len(self.vocab_list)
-
-	def restart(self, key, batch_size=None, shuffle=True):
-		'''Initialize mini-batches. Must call this function before :func:`get_next_batch`
-		or an epoch is end.
-
-		Arguments:
-				key (str): must be contained in `key_name`
-				batch_size (None or int): default (None): use last batch_size.
-				shuffle (bool): whether to shuffle the data. default: `True`
-		'''
-		if key not in self.key_name:
-			raise ValueError("No set named %s." % key)
-		if batch_size is None and self.batch_size[key] is None:
-			raise ValueError("You need batch_size to intialize.")
-		if shuffle:
-			random.shuffle(self.index[key])
-
-		self.batch_id[key] = 0
-		if batch_size is not None:
-			self.batch_size[key] = batch_size
-		print("%s set restart, %d batches and %d left" %
-			  (key, len(self.index[key]) //
-			   self.batch_size[key], len(self.index[key]) %
-			   self.batch_size[key]))
-
-	def get_batch(self, key, index):
+	def get_batch(self, key, index, needhash=False):
 		'''Get a batch of specified `index`.
 
 		Arguments:
-				key (str): must be contained in `key_name`
-				index (list): a list of specified index
+			key (str): must be contained in `key_name`
+			index (list): a list of specified index
+			needhash (bool): whether to return a hashvalue
+				representing this batch of data. Default: False.
 
 		Returns:
-				A dict at least contains ``sentence``, ``sentence_length``. See the example belows.
+			(dict): A dict at least contains:
+
+				* sentence_length(list): A 1-d list, the length of sentence in each batch.
+				  Size: `[batch_size]`
+				* sentence(:class:`numpy.array`): A 2-d padding array containing id of words.
+				  Only provide valid words. `unk_id` will be used if a word is not valid.
+				  Size: `[batch_size, max(sent_length)]`
+				* sentence_allwords(:class:`numpy.array`): A 2-d padding array containing id of words.
+				  Provide both valid and invalid words.
+				  Size: `[batch_size, max(sent_length)]`
+				* hashvalue(bytes): (If `needhash` is True.) A bytes representing hash value of the data.
 
 		Examples:
-				>>> dataloader.get_batch('train', 1)
-				>>>
+			>>> # vocab_list = ["<pad>", "<unk>", "<go>", "<eos>", "how", "are", "you",
+			>>> #	"hello", "i", "am", "fine"]
+			>>> dataloader.get_batch('train', [0, 1])
+			{
+				"sentence": [
+						[2, 4, 5, 6, 3],   # first sentence: <go> how are you <eos>
+						[2, 7, 3, 0, 0],   # second sentence:  <go> hello <eos> <pad> <pad>
+					],
+				"sentence_length": [5, 3], # length of sentences
+			}
 
 		Todo:
-				* fix the missing example
+			* add invalid_vocab examples
+			* mark which array is np.array
 		'''
 		if key not in self.key_name:
 			raise ValueError("No set named %s." % key)
 		res = {}
 		batch_size = len(index)
-		res["sentence_length"] = np.array(
-			list(map(lambda i: len(self.data[key][i]), index)))
-		res["sentence"] = np.zeros(
+		res["sentence_length"] = np.array( \
+			list(map(lambda i: len(self.data[key]['sen'][i]), index)))
+		res_sent = res["sentence"] = np.zeros( \
 			(batch_size, np.max(res["sentence_length"])), dtype=int)
 		for i, j in enumerate(index):
-			sentence = self.data[key][j]
+			sentence = self.data[key]['sen'][j]
 			res["sentence"][i, :len(sentence)] = sentence
+
+		if needhash:
+			unordered_hash = UnorderedSha256()
+			for j in index:
+				unordered_hash.update_data(repr((self.data[key]['sen'][j], self.valid_vocab_len)).encode())
+			res["hashvalue"] = unordered_hash.digest()
+			# hashvalue must be unique for representing the whole batch
+
+		res["sentence_allwords"] = res_sent.copy()
+		res_sent[res_sent >= self.valid_vocab_len] = self.unk_id
 		return res
-
-	def get_next_batch(self, key, ignore_left_samples=False):
-		'''Get next batch.
-
-		Arguments:
-				key (str): must be contained in `key_name`
-				ignore_left_samples (bool): Ignore the last batch, whose sample num
-						is not equal to `batch_size`. Default: `False`
-
-		Returns:
-				A dict like :func:`get_batch`, or None if the epoch is end.
-		'''
-		if key not in self.key_name:
-			raise ValueError("No set named %s." % key)
-		if self.batch_size[key] is None:
-			raise RuntimeError(
-				"Please run restart before calling this function.")
-		batch_id = self.batch_id[key]
-		start, end = batch_id * \
-			self.batch_size[key], (batch_id + 1) * self.batch_size[key]
-		if start >= len(self.index[key]):
-			return None
-		if ignore_left_samples and end > len(self.index[key]):
-			return None
-		index = self.index[key][start:end]
-		res = self.get_batch(key, index)
-		self.batch_id[key] += 1
-		return res
-
-	def sen_to_index(self, sen):
-		'''Convert a sentences from string to index representation.
-
-		Arguments:
-				sen (list): a list of str, representing each token of the sentences.
-
-		Examples:
-				>>> dataloader.sen_to_index(
-				...		["<go>", "I", "have", "been", "to", "Sichuan", "province", "eos"])
-				>>>
-
-		Todo:
-				* fix the missing example
-		'''
-		return list(map(lambda word: self.word2id.get(word, self.unk_id), sen))
-
-	def trim_index(self, index):
-		'''Trim index. There will be two steps:
-				* find first `<eos>` and abondon words after it (included the `<eos>`).
-				* ignore `<pad>` s at the end of the sentence.
-
-		Arguments:
-				index (list): a list of int
-
-		Examples:
-				>>> dataloader.index_to_sen(
-				...		[])
-				>>>
-
-		Todo:
-				* fix the missing example
-		'''
-
-		index = trim_before_target(list(index), self.eos_id)
-		idx = len(index)
-		while index[idx - 1] == self.pad_id:
-			idx -= 1
-		index = index[:idx]
-		return index
-
-	def index_to_sen(self, index, trim=True):
-		'''Convert a sentences from index to string representation
-
-		Arguments:
-				index (list): a list of int
-				trim (bool): if True, call :func:`trim_index` before convertion.
-
-		Examples:
-				>>> dataloader.index_to_sen(
-				...		[])
-				>>>
-
-		Todo:
-				* fix the missing example
-		'''
-		if trim:
-			index = self.trim_index(index)
-		return list(map(lambda word: self.vocab_list[word], index))
 
 	def get_teacher_forcing_metric(self, gen_prob_key="gen_prob"):
 		'''Get metric for teacher-forcing mode.
@@ -246,101 +92,134 @@ class LanguageGeneration(Dataloader):
 		Arguments:
 				gen_prob_key (str): default: `gen_prob`. Refer to :class:`.metric.PerlplexityMetric`
 		'''
-		return PerlplexityMetric(self,
-								 data_key='sentence',
-								 data_len_key='sentence_length',
-								 gen_prob_key=gen_prob_key)
+		metric = MetricChain()
+		metric.add_metric(HashValueRecorder(hash_key="teacher_forcing_hashvalue"))
+		metric.add_metric(PerlplexityMetric(self, \
+					reference_key='sentence', \
+					reference_len_key='sentence_length', \
+					gen_prob_key=gen_prob_key))
+		return metric
 
 	def get_inference_metric(self, gen_key="gen"):
 		'''Get metric for inference.
 
 		It contains:
 
-		* :class:`.metric.BleuCorpusMetric`
-		# * :class:`.metric.SingleDialogRecorder`
+		* :class:`.metric.LanguageGenerationRecorder`
 
 		Arguments:
-				gen_key (str): default: "gen". Refer to :class:`.metric.BleuCorpusMetric` or
-							   :class:`.metric.SingleDialogRecorder`
+				gen_key (str): default: "gen". Refer to :class:`.metric.LanguageGenerationRecorder`
 		'''
 		metric = MetricChain()
-		metric.add_metric(BleuCorpusMetric(self, data_key='sentence', gen_key=gen_key))
-		metric.add_metric(LanguageGenerationRecorder(self,
-													 sentence_key="sentence",
+		metric.add_metric(HashValueRecorder(hash_key="inference_hashvalue"))
+		metric.add_metric(LanguageGenerationRecorder(self, \
 													 gen_key=gen_key))
 		return metric
 
 
 class MSCOCO(LanguageGeneration):
 	'''A dataloder for preprocessed MSCOCO dataset.
-	source: http://images.cocodataset.org/annotations/annotations_trainval2017.zip)
 
 	Arguments:
 			file_path (str): a str indicates the dir of MSCOCO dataset.
-			min_vocab_times (int): A cut-off threshold of `UNK` tokens. All tokens appear
-					less than `min_vocab_times`	will be replaced by `<unk>`. Default: 10.
+			valid_vocab_times (int): A cut-off threshold of valid tokens. All tokens appear
+					not less than `min_vocab_times` in **training set** will be marked as valid words.
+					Default: 10.
 			max_sen_length (int): All sentences longer than `max_sen_length` will be shortened
 					to first `max_sen_length` tokens. Default: 50.
+			invalid_vocab_times (int):  A cut-off threshold of invalid tokens. All tokens appear
+					not less than `invalid_vocab_times` in the **whole dataset** (except valid words) will be
+					marked as invalid words. Otherwise, they are unknown words, both in training or
+					testing stages. Default: 0 (No unknown words).
 
-	Refer to :class:`.LanguageGeneration` for attributes.
+	Refer to :class:`.LanguageGeneration` for attributes and methods.
 
-	Todo:
-			* add references
+	References:
+		[1] http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+		[2] Lin T Y, Maire M, Belongie S, et al. Microsoft COCO: Common Objects in Context. ECCV 2014.
+
 	'''
 
-	def __init__(self, file_path, min_vocab_times=10, max_sen_length=50):
+	def __init__(self, file_path, min_vocab_times=10, max_sen_length=50, invalid_vocab_times=0):
 		self._file_path = file_path
 		self._min_vocab_times = min_vocab_times
 		self._max_sen_length = max_sen_length
+		self._invalid_vocab_times = invalid_vocab_times
 		super(MSCOCO, self).__init__()
 
 	def _load_data(self):
-		r'''Loading dataset, invoked by LanguageGeneration.__init__
+		r'''Loading dataset, invoked by `LanguageGeneration.__init__`
 		'''
 		origin_data = {}
 		for key in self.key_name:
 			f_file = open("%s/mscoco_%s.txt" % (self._file_path, key))
-			origin_data[key] = list(
+			origin_data[key] = {}
+			origin_data[key]['sen'] = list( \
 				map(lambda line: line.split(), f_file.readlines()))
 
-		vocab = list(chain(*(origin_data['train'])))
+		raw_vocab_list = list(chain(*(origin_data['train']['sen'])))
 		# Important: Sort the words preventing the index changes between
 		# different runs
-		vocab = sorted(Counter(vocab).most_common(),
+		vocab = sorted(Counter(raw_vocab_list).most_common(), \
 					   key=lambda pair: (-pair[1], pair[0]))
-		left_vocab = list(
-			filter(
-				lambda x: x[1] >= self._min_vocab_times,
+		left_vocab = list( \
+			filter( \
+				lambda x: x[1] >= self._min_vocab_times, \
 				vocab))
 		vocab_list = self.ext_vocab + list(map(lambda x: x[0], left_vocab))
-		word2id = {w: i for i, w in enumerate(vocab_list)}
+		valid_vocab_len = len(vocab_list)
+		valid_vocab_set = set(vocab_list)
+
+		for key in self.key_name:
+			if key == 'train':
+				continue
+			raw_vocab_list.extend(list(chain(*(origin_data[key]['sen']))))
+		vocab = sorted(Counter(raw_vocab_list).most_common(), \
+					   key=lambda pair: (-pair[1], pair[0]))
+		left_vocab = list( \
+			filter( \
+				lambda x: x[1] >= self._invalid_vocab_times and x[0] not in valid_vocab_set, \
+				vocab))
+		vocab_list.extend(list(map(lambda x: x[0], left_vocab)))
+
+		print("valid vocab list length = %d" % valid_vocab_len)
 		print("vocab list length = %d" % len(vocab_list))
 
+		word2id = {w: i for i, w in enumerate(vocab_list)}
 		def line2id(line):
-			return ([self.go_id] +
-					list(map(lambda word: word2id[word] if word in word2id else self.unk_id, line))
+			return ([self.go_id] + \
+					list(map(lambda word: word2id[word] if word in word2id else self.unk_id, line)) \
 					+ [self.eos_id])[:self._max_sen_length]
 
 		data = {}
+		data_size = {}
 		for key in self.key_name:
-			data[key] = list(map(line2id, origin_data[key]))
+			data[key] = {}
+			data[key]['sen'] = list(map(line2id, origin_data[key]['sen']))
+			data_size[key] = len(data[key]['sen'])
 
-			vocab = list(chain(*(origin_data[key])))
+			vocab = list(chain(*(origin_data[key]['sen'])))
 			vocab_num = len(vocab)
-			oov_num = len(
-				list(
-					filter(
-						lambda word: word not in word2id,
+			oov_num = len( \
+				list( \
+					filter( \
+						lambda word: word not in word2id, \
 						vocab)))
-			length = list(
-				map(len, origin_data[key]))
-			cut_num = np.sum(
-				np.maximum(
-					np.array(length) -
-					self._max_sen_length +
-					1,
+			invalid_num = len( \
+				list( \
+					filter( \
+						lambda word: word not in valid_vocab_set, \
+						vocab))) - oov_num
+			length = list( \
+				map(len, origin_data[key]['sen']))
+			cut_num = np.sum( \
+				np.maximum( \
+					np.array(length) - \
+					self._max_sen_length + \
+					1, \
 					0))
-			print(
-				"%s set. OOV rate: %f, max length before cut: %d, cut word rate: %f" %
-				(key, oov_num / vocab_num, max(length), cut_num / vocab_num))
-		return vocab_list, data
+			print( \
+				"%s set. invalid rate: %f, unknown rate: %f, max length before cut: %d, cut word rate: %f" % \
+				(key, invalid_num / vocab_num, oov_num / vocab_num, max(length), cut_num / vocab_num))
+		return vocab_list, valid_vocab_len, data, data_size
